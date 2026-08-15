@@ -1,0 +1,457 @@
+{
+  "name": "Lead Capture → Enrich → Score → Route",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lead-capture",
+        "responseMode": "onReceived",
+        "responseData": "={{ JSON.stringify({ received: true }) }}",
+        "options": {}
+      },
+      "id": "a1f3c9d2-0b41-4e6a-9c11-1d2e3f4a5b60",
+      "name": "Lead Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [-620, 300],
+      "webhookId": "a1f3c9d2-0b41-4e6a-9c11-1d2e3f4a5b60",
+      "notes": "POST JSON: { name, email, company, message }. Responds immediately so the form never waits on enrichment.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "n-first",
+              "name": "first_name",
+              "value": "={{ ($json.body.name || '').trim().split(/\\s+/)[0] || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "n-last",
+              "name": "last_name",
+              "value": "={{ ($json.body.name || '').trim().split(/\\s+/).slice(1).join(' ') }}",
+              "type": "string"
+            },
+            {
+              "id": "n-email",
+              "name": "email",
+              "value": "={{ ($json.body.email || '').trim().toLowerCase() }}",
+              "type": "string"
+            },
+            {
+              "id": "n-domain",
+              "name": "email_domain",
+              "value": "={{ ($json.body.email || '').trim().toLowerCase().split('@')[1] || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "n-company",
+              "name": "company",
+              "value": "={{ ($json.body.company || '').trim() }}",
+              "type": "string"
+            },
+            {
+              "id": "n-message",
+              "name": "message",
+              "value": "={{ ($json.body.message || '').trim() }}",
+              "type": "string"
+            },
+            {
+              "id": "n-received",
+              "name": "received_at",
+              "value": "={{ $now.toISO() }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      },
+      "id": "b2e4d0a3-1c52-4f7b-8d22-2e3f4a5b6c71",
+      "name": "Normalize Lead",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [-400, 300],
+      "notes": "Trim everything, lowercase the email, split the full name, and pull the domain out once so scoring and enrichment both reuse it.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "url": "https://enrichment.example.com/v1/enrich",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "email",
+              "value": "={{ $json.email }}"
+            },
+            {
+              "name": "domain",
+              "value": "={{ $json.email_domain }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 8000,
+          "response": {
+            "response": {
+              "neverError": false
+            }
+          }
+        }
+      },
+      "id": "c3f5e1b4-2d63-4a8c-9e33-3f4a5b6c7d82",
+      "name": "Enrich Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [-180, 300],
+      "onError": "continueErrorOutput",
+      "notes": "Swap in Clearbit / Apollo / your provider. Credential goes on this node — never inline in the URL. The error output is wired so a dead enrichment vendor cannot drop a lead.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f-enriched",
+              "name": "enriched",
+              "value": false,
+              "type": "boolean"
+            },
+            {
+              "id": "f-reason",
+              "name": "enrichment_error",
+              "value": "={{ $json.error?.message || 'enrichment provider unavailable' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "d4a6f2c5-3e74-4b9d-8f44-4a5b6c7d8e93",
+      "name": "Enrichment Unavailable",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [-180, 500],
+      "notes": "Degrade, don't drop. The lead continues to scoring with enriched=false and simply misses the enrichment points.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "s-enriched",
+              "name": "enriched",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "s-size",
+              "name": "company_size",
+              "value": "={{ $json.employees || $json.company?.metrics?.employees || null }}",
+              "type": "number"
+            },
+            {
+              "id": "s-industry",
+              "name": "industry",
+              "value": "={{ $json.industry || $json.company?.category?.industry || '' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "e5b7a3d6-4f85-4c0e-9a55-5b6c7d8e9fa4",
+      "name": "Flatten Enrichment",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [40, 200],
+      "notes": "Every provider nests its payload differently. Normalize here so the scoring rules only ever read flat fields.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Transparent, rule-based lead scoring. 0-100.\n//\n// This is deliberately NOT an LLM call. A score that routes revenue has to be\n// auditable (\"why was this a 65?\"), free, and instant. Every point below is\n// traceable to a rule you can argue with in a sales meeting.\n//\n// Thresholds consumed by the Switch node downstream:\n//   >= 70  hot      -> notify sales in real time + upsert to CRM\n//   40-69  nurture  -> drip sequence, no human touch yet\n//   <  40  log only -> stored for reporting, nobody is paged\n\nconst FREEMAIL = new Set([\n  'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com',\n  'icloud.com', 'me.com', 'live.com', 'msn.com', 'proton.me', 'protonmail.com',\n  'gmx.com', 'mail.com', 'yandex.com', 'zoho.com',\n]);\n\nconst ROLE_PREFIXES = new Set([\n  'info', 'sales', 'support', 'admin', 'contact', 'hello', 'noreply', 'no-reply',\n  'billing', 'webmaster', 'postmaster',\n]);\n\nconst out = [];\n\nfor (const item of $input.all()) {\n  const lead = item.json;\n  const reasons = [];\n  let score = 0;\n\n  const email = (lead.email || '').toLowerCase();\n  const domain = (lead.email_domain || '').toLowerCase();\n  const localPart = email.split('@')[0] || '';\n\n  // --- Email quality (max 40) ---------------------------------------------\n  // A business domain is the single strongest cheap signal that this is a real\n  // buyer and not someone kicking tires from a personal address.\n  const looksLikeEmail = /^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/.test(email);\n  if (!looksLikeEmail) {\n    reasons.push('email is malformed (-)');\n  } else if (domain && !FREEMAIL.has(domain)) {\n    score += 40;\n    reasons.push('business email domain (+40)');\n  } else {\n    score += 10;\n    reasons.push('freemail domain (+10)');\n  }\n\n  // A role address means no named human owns the conversation yet.\n  if (ROLE_PREFIXES.has(localPart)) {\n    score -= 10;\n    reasons.push('role address, not a person (-10)');\n  }\n\n  // --- Company named (max 15) ---------------------------------------------\n  if ((lead.company || '').length >= 2) {\n    score += 15;\n    reasons.push('company provided (+15)');\n  }\n\n  // --- Message intent (max 25) --------------------------------------------\n  // Length is a crude proxy for effort, and effort correlates with intent.\n  // Someone who typed three paragraphs has a problem they want solved.\n  const msg = lead.message || '';\n  if (msg.length >= 300) {\n    score += 25;\n    reasons.push('detailed message, 300+ chars (+25)');\n  } else if (msg.length >= 80) {\n    score += 15;\n    reasons.push('substantive message, 80+ chars (+15)');\n  } else if (msg.length > 0) {\n    score += 5;\n    reasons.push('short message (+5)');\n  }\n\n  // --- Enrichment (max 20) -------------------------------------------------\n  // Only additive. A lead is never punished for the enrichment vendor being\n  // down, which is why the fallback branch sets enriched=false rather than\n  // failing the execution.\n  if (lead.enriched === true) {\n    score += 10;\n    reasons.push('enrichment matched (+10)');\n\n    const size = Number(lead.company_size);\n    if (Number.isFinite(size) && size >= 50) {\n      score += 10;\n      reasons.push(`company size ${size} (+10)`);\n    }\n  } else {\n    reasons.push('no enrichment data (+0)');\n  }\n\n  score = Math.max(0, Math.min(100, score));\n\n  const band = score >= 70 ? 'hot' : score >= 40 ? 'nurture' : 'log';\n\n  out.push({\n    json: {\n      ...lead,\n      score,\n      band,\n      // Shipped with the record on purpose: when sales asks why a lead was not\n      // routed to them, the answer is already attached to the lead.\n      score_reasons: reasons,\n    },\n  });\n}\n\nreturn out;\n"
+      },
+      "id": "f6c8b4e7-5a96-4d1f-8b66-6c7d8e9fa0b5",
+      "name": "Score Lead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [260, 300],
+      "notes": "Rules, not an LLM: auditable, free, instant. Reasons ride along with the lead so the score can be defended.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "r-hot",
+                    "leftValue": "={{ $json.score }}",
+                    "rightValue": 70,
+                    "operator": {
+                      "type": "number",
+                      "operation": "gte"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "hot"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "r-nurture",
+                    "leftValue": "={{ $json.score }}",
+                    "rightValue": 40,
+                    "operator": {
+                      "type": "number",
+                      "operation": "gte"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "nurture"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "log only"
+        }
+      },
+      "id": "a7d9c5f8-6b07-4e2a-9c77-7d8e9fa0b1c6",
+      "name": "Route by Score",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [480, 300],
+      "notes": "Rules are evaluated top-down, so the >=40 rule only ever sees leads that already failed >=70. The fallback output catches everything under 40.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://chat.example.com/api/v1/webhook/sales-alerts",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: `Hot lead (${$json.score}/100): ${$json.first_name} ${$json.last_name} at ${$json.company || 'unknown company'}\\n${$json.email}\\n${$json.score_reasons.join(', ')}\\n\\n${$json.message.slice(0, 400)}` }) }}",
+        "options": {
+          "timeout": 8000
+        }
+      },
+      "id": "b8e0d6a9-7c18-4f3b-8d88-8e9fa0b1c2d7",
+      "name": "Notify Sales Channel",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [760, 140],
+      "notes": "Swap in your Slack / Cliq / Teams incoming-webhook URL. Store it as a credential or an environment variable, not in the node.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://crm.example.com/api/v2/leads/upsert",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ email: $json.email, first_name: $json.first_name, last_name: $json.last_name, company: $json.company, source: 'website-form', score: $json.score, score_reasons: $json.score_reasons, status: 'hot' }) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "c9f1e7b0-8d29-4a4c-9e99-9fa0b1c2d3e8",
+      "name": "Upsert CRM Record",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [980, 140],
+      "notes": "Upsert on email, not create. Re-submitting the same form twice should update one record, not open two.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://marketing.example.com/api/v1/sequences/nurture/subscribers",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ email: $json.email, first_name: $json.first_name, company: $json.company, score: $json.score }) }}",
+        "options": {
+          "timeout": 8000
+        }
+      },
+      "id": "d0a2f8c1-9e30-4b5d-8fa0-a0b1c2d3e4f9",
+      "name": "Add to Nurture Sequence",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [760, 300],
+      "notes": "No human is paged for this band. Swap in Mailchimp / HubSpot / your ESP.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://warehouse.example.com/api/v1/tables/leads/rows",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ received_at: $json.received_at, email: $json.email, company: $json.company, score: $json.score, band: $json.band, score_reasons: $json.score_reasons.join('; ') }) }}",
+        "options": {
+          "timeout": 8000
+        }
+      },
+      "id": "e1b3a9d2-0f41-4c6e-9ab1-b1c2d3e4f50a",
+      "name": "Append to Lead Log",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [760, 460],
+      "notes": "Swap in Google Sheets / Postgres / your warehouse. Low-scoring leads are still recorded — you cannot tune a scoring rule you never measured.",
+      "notesInFlow": true
+    }
+  ],
+  "connections": {
+    "Lead Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Lead": {
+      "main": [
+        [
+          {
+            "node": "Enrich Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enrich Contact": {
+      "main": [
+        [
+          {
+            "node": "Flatten Enrichment",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Enrichment Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Flatten Enrichment": {
+      "main": [
+        [
+          {
+            "node": "Score Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enrichment Unavailable": {
+      "main": [
+        [
+          {
+            "node": "Score Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score Lead": {
+      "main": [
+        [
+          {
+            "node": "Route by Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Score": {
+      "main": [
+        [
+          {
+            "node": "Notify Sales Channel",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Add to Nurture Sequence",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Append to Lead Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Sales Channel": {
+      "main": [
+        [
+          {
+            "node": "Upsert CRM Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true,
+    "errorWorkflow": ""
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
