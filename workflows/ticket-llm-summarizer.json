@@ -1,0 +1,441 @@
+{
+  "name": "Ticket LLM Summarizer & Router",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ticket-triage",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "b1c2d3e4-f506-4172-8394-05a6b7c8d9e0",
+      "name": "New Ticket Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [-700, 300],
+      "webhookId": "b1c2d3e4-f506-4172-8394-05a6b7c8d9e0",
+      "notes": "POST JSON: { ticket_id, subject, body, requester }. Uses responseNode mode so the caller gets the classification back synchronously and can act on it.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "t-id",
+              "name": "ticket_id",
+              "value": "={{ $json.body.ticket_id || $json.body.id || 'unknown' }}",
+              "type": "string"
+            },
+            {
+              "id": "t-subject",
+              "name": "subject",
+              "value": "={{ ($json.body.subject || '').trim() }}",
+              "type": "string"
+            },
+            {
+              "id": "t-body",
+              "name": "ticket_body",
+              "value": "={{ ($json.body.body || $json.body.description || '').trim().slice(0, 6000) }}",
+              "type": "string"
+            },
+            {
+              "id": "t-requester",
+              "name": "requester",
+              "value": "={{ ($json.body.requester || $json.body.from || 'unknown').trim() }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      },
+      "id": "c2d3e4f5-0617-4283-94a5-16b7c8d9e0f1",
+      "name": "Normalize Ticket",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [-480, 300],
+      "notes": "Truncate the body to 6000 characters here rather than in the prompt. A pasted 40-page log should cost a bounded number of tokens.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: 'gpt-4o-mini',\n  temperature: 0,\n  response_format: { type: 'json_object' },\n  messages: [\n    {\n      role: 'system',\n      content: [\n        'You are a service desk triage assistant for a managed services provider.',\n        'Classify the ticket and summarize it for the engineer who will pick it up.',\n        '',\n        'Respond with a single JSON object and nothing else. No markdown, no code fences, no commentary.',\n        'The object must have exactly these keys:',\n        '  \"category\": one of \"voice\", \"network\", \"infrastructure\", \"other\"',\n        '  \"confidence\": a number between 0 and 1',\n        '  \"summary\": exactly three sentences describing the reported problem, its scope, and its urgency',\n        '  \"first_diagnostic_step\": one sentence naming the single first thing the engineer should check',\n        '',\n        'Category definitions:',\n        '  voice          — phones, PBX, SIP trunks, call quality, voicemail, dial plans',\n        '  network        — connectivity, routing, switching, wireless, VPN, firewall, DNS, ISP circuits',\n        '  infrastructure — servers, virtualization, storage, backups, identity, email systems, endpoints',\n        '  other          — billing, scheduling, access requests, or anything not clearly in the three above',\n        '',\n        'If the ticket is ambiguous, choose the best fit and lower the confidence. Never invent a fifth category.',\n        'Do not speculate about causes the ticket text does not support.'\n      ].join('\\n')\n    },\n    {\n      role: 'user',\n      content: 'Subject: ' + $json.subject + '\\nRequester: ' + $json.requester + '\\n\\nBody:\\n' + $json.ticket_body\n    }\n  ]\n}) }}",
+        "options": {
+          "timeout": 45000
+        }
+      },
+      "id": "d3e4f506-1728-4394-a5b6-27c8d9e0f102",
+      "name": "Classify & Summarize",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [-240, 300],
+      "onError": "continueErrorOutput",
+      "notes": "Attach an \"OpenAI-or-compatible API\" credential. temperature 0 because triage should be repeatable: the same ticket submitted twice must not land in two different queues.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse and validate the model's JSON. Never trust it structurally.\n//\n// response_format: json_object makes well-formed JSON very likely, not certain,\n// and it says nothing about whether the KEYS are right. Models drop fields,\n// invent categories, wrap output in code fences, and occasionally return prose\n// when they decide the request was unusual. Any of those would otherwise route\n// a real ticket into a nonexistent queue.\n//\n// Everything that fails validation falls through to category \"other\" with\n// needs_review set. A human sees it; nothing is silently dropped.\n\nconst VALID_CATEGORIES = ['voice', 'network', 'infrastructure', 'other'];\n\nconst ticket = $('Normalize Ticket').first().json;\n\nconst fallback = (reason) => ({\n  json: {\n    ...ticket,\n    category: 'other',\n    confidence: 0,\n    summary: `Automatic classification failed (${reason}). Subject: ${ticket.subject}`,\n    first_diagnostic_step: 'Read the ticket manually — the classifier did not return usable output.',\n    needs_review: true,\n    classifier_error: reason,\n  },\n});\n\nconst results = [];\n\nfor (const item of $input.all()) {\n  const content = item.json?.choices?.[0]?.message?.content;\n\n  if (typeof content !== 'string' || content.trim() === '') {\n    results.push(fallback('empty model response'));\n    continue;\n  }\n\n  // Strip ```json fences if the model added them despite instructions.\n  const cleaned = content\n    .trim()\n    .replace(/^```(?:json)?\\s*/i, '')\n    .replace(/\\s*```$/, '')\n    .trim();\n\n  let parsed;\n  try {\n    parsed = JSON.parse(cleaned);\n  } catch (e) {\n    results.push(fallback('malformed JSON: ' + e.message));\n    continue;\n  }\n\n  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {\n    results.push(fallback('model returned a non-object'));\n    continue;\n  }\n\n  const category = String(parsed.category || '').toLowerCase().trim();\n  if (!VALID_CATEGORIES.includes(category)) {\n    results.push(fallback(`unknown category \"${parsed.category}\"`));\n    continue;\n  }\n\n  const summary = String(parsed.summary || '').trim();\n  if (summary === '') {\n    results.push(fallback('missing summary'));\n    continue;\n  }\n\n  let confidence = Number(parsed.confidence);\n  if (!Number.isFinite(confidence)) confidence = 0.5;\n  confidence = Math.max(0, Math.min(1, confidence));\n\n  const firstStep = String(parsed.first_diagnostic_step || '').trim();\n\n  results.push({\n    json: {\n      ...ticket,\n      category,\n      confidence,\n      summary,\n      first_diagnostic_step: firstStep || 'No first step suggested.',\n      // Low-confidence classifications are routed normally but flagged, so the\n      // queue owner knows to sanity-check before spending time on it.\n      needs_review: confidence < 0.5,\n      classifier_error: null,\n    },\n  });\n}\n\nreturn results;\n"
+      },
+      "id": "e4f50617-2839-44a5-b6c7-38d9e0f10213",
+      "name": "Parse & Validate JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [0, 200],
+      "notes": "Validates shape, not just syntax. Anything unparseable or off-schema becomes category \"other\" with needs_review — degraded, never dropped.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// The LLM call itself failed (network, auth, rate limit, 5xx). The ticket still\n// has to go somewhere, so it is routed to \"other\" for a human to pick up.\n\nconst ticket = $('Normalize Ticket').first().json;\nconst err = $input.first().json?.error?.message || 'LLM request failed';\n\nreturn [\n  {\n    json: {\n      ...ticket,\n      category: 'other',\n      confidence: 0,\n      summary: `Classifier unreachable. Subject: ${ticket.subject}`,\n      first_diagnostic_step: 'Read the ticket manually — the classifier could not be reached.',\n      needs_review: true,\n      classifier_error: err,\n    },\n  },\n];\n"
+      },
+      "id": "f5061728-394a-45b6-c7d8-49e0f1021324",
+      "name": "Classifier Unreachable",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [0, 460],
+      "notes": "A triage endpoint that returns a 500 when the model is down turns one outage into two. This branch keeps the webhook contract intact.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "c-voice",
+                    "leftValue": "={{ $json.category }}",
+                    "rightValue": "voice",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "voice"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "c-network",
+                    "leftValue": "={{ $json.category }}",
+                    "rightValue": "network",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "network"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "c-infra",
+                    "leftValue": "={{ $json.category }}",
+                    "rightValue": "infrastructure",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "infrastructure"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "other"
+        }
+      },
+      "id": "a6172839-4a5b-46c7-d8e9-50f102132435",
+      "name": "Route by Category",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [240, 300],
+      "notes": "The fallback output is doing real work here: it catches both genuine \"other\" tickets and every validation failure from the node before it.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://desk.example.com/api/v1/tickets/{{ $json.ticket_id }}/assign",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ queue: 'voice', summary: $json.summary, first_step: $json.first_diagnostic_step, needs_review: $json.needs_review }) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "b7283940-5b6c-47d8-e9f0-6102132435a4",
+      "name": "Assign to Voice Queue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [520, 60],
+      "notes": "Swap in your ticketing system's assignment endpoint. The summary is written back onto the ticket so the engineer reads it in context, not in a chat message.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://desk.example.com/api/v1/tickets/{{ $json.ticket_id }}/assign",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ queue: 'network', summary: $json.summary, first_step: $json.first_diagnostic_step, needs_review: $json.needs_review }) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "c8394051-6c7d-48e9-f001-2132435a4b56",
+      "name": "Assign to Network Queue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [520, 220],
+      "notes": "Swap in your ticketing system's assignment endpoint.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://desk.example.com/api/v1/tickets/{{ $json.ticket_id }}/assign",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ queue: 'infrastructure', summary: $json.summary, first_step: $json.first_diagnostic_step, needs_review: $json.needs_review }) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "d9405162-7d8e-49f0-0123-2435a4b56c78",
+      "name": "Assign to Infrastructure Queue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [520, 380],
+      "notes": "Swap in your ticketing system's assignment endpoint.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://desk.example.com/api/v1/tickets/{{ $json.ticket_id }}/assign",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ queue: 'triage-review', summary: $json.summary, first_step: $json.first_diagnostic_step, needs_review: true, classifier_error: $json.classifier_error }) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "e0516273-8e9f-4001-1234-35a4b56c78d9",
+      "name": "Assign to Triage Review",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [520, 540],
+      "notes": "Genuine \"other\" tickets and classifier failures both land here. Keeping them in one human-reviewed queue is what makes the automation safe to leave running.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ticket_id: $json.ticket_id, category: $json.category, confidence: $json.confidence, summary: $json.summary, first_diagnostic_step: $json.first_diagnostic_step, needs_review: $json.needs_review }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "f1627384-9f00-4112-2345-46b56c78d9e0",
+      "name": "Respond with Classification",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [800, 300],
+      "notes": "Always 200, even on a classifier failure — the caller gets category \"other\" and needs_review true, which is a real answer, not an error to handle.",
+      "notesInFlow": true
+    }
+  ],
+  "connections": {
+    "New Ticket Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Ticket": {
+      "main": [
+        [
+          {
+            "node": "Classify & Summarize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify & Summarize": {
+      "main": [
+        [
+          {
+            "node": "Parse & Validate JSON",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Classifier Unreachable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & Validate JSON": {
+      "main": [
+        [
+          {
+            "node": "Route by Category",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classifier Unreachable": {
+      "main": [
+        [
+          {
+            "node": "Route by Category",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Category": {
+      "main": [
+        [
+          {
+            "node": "Assign to Voice Queue",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Assign to Network Queue",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Assign to Infrastructure Queue",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Assign to Triage Review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assign to Voice Queue": {
+      "main": [
+        [
+          {
+            "node": "Respond with Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assign to Network Queue": {
+      "main": [
+        [
+          {
+            "node": "Respond with Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assign to Infrastructure Queue": {
+      "main": [
+        [
+          {
+            "node": "Respond with Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assign to Triage Review": {
+      "main": [
+        [
+          {
+            "node": "Respond with Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true,
+    "errorWorkflow": ""
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
