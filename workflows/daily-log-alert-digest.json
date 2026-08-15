@@ -1,0 +1,254 @@
+{
+  "name": "Daily Log & Alert Digest",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 7,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      },
+      "id": "a10b2c3d-4e5f-4061-8a72-0b1c2d3e4f50",
+      "name": "Every Morning at 07:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [-640, 300],
+      "notes": "Fires in the n8n instance's timezone. Set that explicitly in workflow settings — a digest that silently shifts an hour twice a year erodes trust in the whole thing.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "url": "https://monitoring.example.com/api/v1/alerts",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "since",
+              "value": "={{ $now.minus({ hours: 24 }).toISO() }}"
+            },
+            {
+              "name": "until",
+              "value": "={{ $now.toISO() }}"
+            },
+            {
+              "name": "limit",
+              "value": "500"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "b21c3d4e-5f60-4172-9b83-1c2d3e4f5061",
+      "name": "Fetch Last 24h of Alerts",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [-420, 300],
+      "notes": "Swap in Zabbix / Datadog / Prometheus Alertmanager / your endpoint. The window is computed from $now rather than hardcoded so a missed run still asks for a full 24 hours.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Group by severity and collapse repeats BEFORE the model sees anything.\n//\n// Flapping is the normal failure mode of alerting: one sick host emits the same\n// alert 400 times overnight. Sending all 400 to an LLM costs real money, blows\n// the context window, and biases the summary toward whatever flapped loudest.\n// Deduplicating first is both cheaper and more accurate.\n\nconst SEVERITY_ORDER = ['critical', 'high', 'warning', 'info'];\n\n// The monitoring API may return a bare array or wrap it. Accept both shapes.\nconst raw = $input.all().flatMap((item) => {\n  const j = item.json;\n  if (Array.isArray(j)) return j;\n  if (Array.isArray(j.alerts)) return j.alerts;\n  if (Array.isArray(j.data)) return j.data;\n  if (Array.isArray(j.result)) return j.result;\n  return [j];\n});\n\nconst normalizeSeverity = (s) => {\n  const v = String(s || 'info').toLowerCase();\n  if (['critical', 'crit', 'disaster', 'p1', 'sev1'].includes(v)) return 'critical';\n  if (['high', 'error', 'major', 'p2', 'sev2'].includes(v)) return 'high';\n  if (['warning', 'warn', 'average', 'p3', 'sev3'].includes(v)) return 'warning';\n  return 'info';\n};\n\n// Identity of an alert = what is broken, on what, at what severity. Timestamps\n// and instance ids are deliberately excluded from the key: they are what make\n// duplicates look unique.\nconst dedupeKey = (a) =>\n  [normalizeSeverity(a.severity), a.host || a.instance || a.resource || 'unknown', a.name || a.alertname || a.message || 'unnamed']\n    .join('|')\n    .toLowerCase();\n\nconst groups = new Map();\n\nfor (const a of raw) {\n  const key = dedupeKey(a);\n  const ts = a.timestamp || a.startsAt || a.clock || a.time || null;\n\n  if (!groups.has(key)) {\n    groups.set(key, {\n      severity: normalizeSeverity(a.severity),\n      host: a.host || a.instance || a.resource || 'unknown',\n      name: a.name || a.alertname || a.message || 'unnamed',\n      count: 0,\n      first_seen: ts,\n      last_seen: ts,\n      sample_message: (a.message || a.description || a.summary || '').slice(0, 200),\n    });\n  }\n\n  const g = groups.get(key);\n  g.count += 1;\n  if (ts) {\n    if (!g.first_seen || ts < g.first_seen) g.first_seen = ts;\n    if (!g.last_seen || ts > g.last_seen) g.last_seen = ts;\n  }\n}\n\nconst deduped = [...groups.values()].sort((x, y) => {\n  const bySeverity = SEVERITY_ORDER.indexOf(x.severity) - SEVERITY_ORDER.indexOf(y.severity);\n  return bySeverity !== 0 ? bySeverity : y.count - x.count;\n});\n\nconst bySeverity = SEVERITY_ORDER.reduce((acc, s) => {\n  acc[s] = deduped.filter((d) => d.severity === s).length;\n  return acc;\n}, {});\n\n// Hard cap what reaches the model. 60 deduplicated groups is already more than\n// a human will act on before lunch, and it bounds token spend on a bad night.\nconst MAX_GROUPS = 60;\nconst truncated = deduped.length > MAX_GROUPS;\n\nreturn [\n  {\n    json: {\n      window_start: $now.minus({ hours: 24 }).toISO(),\n      window_end: $now.toISO(),\n      total_alerts: raw.length,\n      unique_alerts: deduped.length,\n      counts_by_severity: bySeverity,\n      truncated,\n      groups: deduped.slice(0, MAX_GROUPS),\n    },\n  },\n];\n"
+      },
+      "id": "c32d4e5f-6071-4283-8c94-2d3e4f506172",
+      "name": "Group & Deduplicate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-200, 300],
+      "notes": "Collapses flapping alerts before the LLM sees them. Cheaper, and it stops one noisy host from dominating the summary.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: 'gpt-4o-mini',\n  temperature: 0.2,\n  messages: [\n    {\n      role: 'system',\n      content: [\n        'You are an operations engineer writing the morning digest for an on-call team.',\n        'You will be given deduplicated alert groups from the last 24 hours as JSON.',\n        '',\n        'Write exactly this structure and nothing else:',\n        'Line 1: one sentence stating overall health and the total alert volume.',\n        'Lines 2-5: the four most significant issues, one per line, each as \"<severity> — <host>: <what is wrong> (<count>x)\".',\n        'Then a blank line, then a section headed exactly \"Needs human attention:\".',\n        'Under that heading, list only items a human must act on today, one per line, each starting with \"- \".',\n        'If nothing needs human attention, write exactly \"- Nothing. No action required.\"',\n        '',\n        'Rules: do not invent alerts, hosts, or numbers that are not in the input.',\n        'Prefer high count and high severity when choosing what is significant.',\n        'Be terse. No preamble, no sign-off, no markdown headers, no bullets outside the section described above.'\n      ].join('\\n')\n    },\n    {\n      role: 'user',\n      content: 'Alert window: ' + $json.window_start + ' to ' + $json.window_end + '\\n'\n        + 'Total alerts: ' + $json.total_alerts + ', unique after deduplication: ' + $json.unique_alerts + '\\n'\n        + 'Counts by severity: ' + JSON.stringify($json.counts_by_severity) + '\\n'\n        + ($json.truncated ? 'NOTE: the group list below was truncated to the top 60.\\n' : '')\n        + '\\nDeduplicated alert groups:\\n'\n        + JSON.stringify($json.groups, null, 1)\n    }\n  ]\n}) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "d43e5f60-7182-4394-8da5-3e4f50617283",
+      "name": "Summarize with LLM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [20, 300],
+      "onError": "continueErrorOutput",
+      "credentials": {},
+      "notes": "Attach an \"OpenAI-or-compatible API\" header-auth credential to this node. Any OpenAI-compatible base URL works — vLLM, Ollama, LiteLLM, Azure OpenAI. The prompt is kept in plain sight here on purpose: it is the part most likely to need tuning, and it should be reviewable in a diff.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "dg-body",
+              "name": "digest",
+              "value": "={{ $json.choices?.[0]?.message?.content?.trim() || 'The model returned an empty response.' }}",
+              "type": "string"
+            },
+            {
+              "id": "dg-subject",
+              "name": "subject",
+              "value": "={{ 'Ops digest ' + $now.toFormat('yyyy-LL-dd') + ' — ' + ($('Group & Deduplicate').first().json.counts_by_severity.critical || 0) + ' critical, ' + $('Group & Deduplicate').first().json.unique_alerts + ' unique alerts' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      },
+      "id": "e54f6071-8293-44a5-9eb6-4f5061728394",
+      "name": "Build Digest",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [260, 200],
+      "notes": "The counts in the subject line come from the deduplication node, not from the model. Numbers a human scans at a glance should never be generated text.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "fb-body",
+              "name": "digest",
+              "value": "={{ 'The summarization step failed, so this digest is unsummarized.\\n\\nError: ' + ($json.error?.message || 'unknown') + '\\n\\nRaw counts by severity: ' + JSON.stringify($('Group & Deduplicate').first().json.counts_by_severity) + '\\n\\nTop alert groups:\\n' + $('Group & Deduplicate').first().json.groups.slice(0, 10).map(g => `${g.severity} — ${g.host}: ${g.name} (${g.count}x)`).join('\\n') }}",
+              "type": "string"
+            },
+            {
+              "id": "fb-subject",
+              "name": "subject",
+              "value": "={{ 'Ops digest ' + $now.toFormat('yyyy-LL-dd') + ' — UNSUMMARIZED (LLM unavailable)' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      },
+      "id": "f6507182-93a4-4b6c-8fc7-506172839405",
+      "name": "Digest Without LLM",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [260, 420],
+      "notes": "If the model is down the digest still goes out, just plainer. An ops digest that silently stops arriving is worse than an ugly one.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "fromEmail": "n8n@example.com",
+        "toEmail": "ops-team@example.com",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.digest }}",
+        "options": {}
+      },
+      "id": "a7618293-04b5-4c7d-9ad8-617283940516",
+      "name": "Email the Digest",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [520, 300],
+      "notes": "Attach the \"SMTP\" credential. Swap for an HTTP Request to a chat webhook if your team lives in Slack or Cliq rather than email.",
+      "notesInFlow": true
+    }
+  ],
+  "connections": {
+    "Every Morning at 07:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch Last 24h of Alerts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Last 24h of Alerts": {
+      "main": [
+        [
+          {
+            "node": "Group & Deduplicate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Group & Deduplicate": {
+      "main": [
+        [
+          {
+            "node": "Summarize with LLM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summarize with LLM": {
+      "main": [
+        [
+          {
+            "node": "Build Digest",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Digest Without LLM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Digest": {
+      "main": [
+        [
+          {
+            "node": "Email the Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Digest Without LLM": {
+      "main": [
+        [
+          {
+            "node": "Email the Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true,
+    "timezone": "America/Phoenix",
+    "errorWorkflow": ""
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
