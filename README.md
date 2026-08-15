@@ -56,7 +56,11 @@ npm install --no-save n8n-nodes-base n8n-core
 node scripts/validate-workflows.mjs
 ```
 
-Current status: **structurally validated against n8n-nodes-base 2.15.1 (438 node types); interactive import-test pending.** All three workflows pass every check above. They have not yet been opened in a running n8n instance, so this README does not claim they have been.
+Current status: **import-tested on n8n 2.22.6** (bundling n8n-nodes-base 2.22.3), 2026-08-14.
+
+All three workflows were imported into a running n8n instance via `n8n import:workflow` and each was then opened on the canvas. Every node rendered — 11, 7, and 11 nodes respectively — with no "unrecognized node type" or unsupported-version errors.
+
+The one node flagged on the canvas is `Email the Digest`, which declares the `smtp` credential as required. That is expected: these templates ship with no credentials attached by design. Wire one up and the flag clears.
 
 ## Design notes
 
