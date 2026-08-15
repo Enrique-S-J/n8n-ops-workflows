@@ -5,6 +5,8 @@ The inbound-lead pipeline, written as a generic pattern: accept a form submissio
 **File:** [`workflows/lead-capture-enrich-score-route.json`](../workflows/lead-capture-enrich-score-route.json)
 **Trigger:** Webhook (`POST /webhook/lead-capture`)
 
+![The workflow on the n8n canvas: a webhook feeds normalization, then an enrichment request whose success and error outputs both converge on the scoring node, which routes through a switch into hot, nurture, and log-only branches.](img/lead-capture-enrich-score-route.png)
+
 ## Node-by-node
 
 ### 1. Lead Webhook

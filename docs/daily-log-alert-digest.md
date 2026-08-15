@@ -5,6 +5,10 @@ A scheduled job that pulls 24 hours of monitoring alerts, collapses the noise, h
 **File:** [`workflows/daily-log-alert-digest.json`](../workflows/daily-log-alert-digest.json)
 **Trigger:** Schedule (daily, 07:00)
 
+![The workflow on the n8n canvas: a schedule trigger feeds an alert fetch and a deduplication node, then an LLM summarization request whose success and error outputs converge on a single email delivery node.](img/daily-log-alert-digest.png)
+
+The warning badge on the email node is the missing SMTP credential — these templates ship without credentials on purpose.
+
 ## Node-by-node
 
 ### 1. Every Morning at 07:00

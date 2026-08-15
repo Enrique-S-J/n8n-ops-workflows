@@ -5,6 +5,8 @@ A synchronous triage endpoint. Post a ticket, get back a category, a three-sente
 **File:** [`workflows/ticket-llm-summarizer.json`](../workflows/ticket-llm-summarizer.json)
 **Trigger:** Webhook (`POST /webhook/ticket-triage`), responds synchronously
 
+![The workflow on the n8n canvas: a webhook and normalize step feed an LLM classification request, whose success path goes to JSON validation and whose error path goes to a fallback, both converging on a switch that fans out to voice, network, infrastructure, and triage-review queues before responding to the webhook.](img/ticket-llm-summarizer.png)
+
 ## Node-by-node
 
 ### 1. New Ticket Webhook
