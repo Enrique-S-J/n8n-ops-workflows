@@ -56,6 +56,8 @@ npm install --no-save n8n-nodes-base n8n-core
 node scripts/validate-workflows.mjs
 ```
 
+CI runs that deep check on every push against two versions of the node packages: the ones bundled with n8n 2.22.6, and the current stable release (n8n-nodes-base 2.48.5 on 2026-11-23, when both passed). A green run means every node type and version exists in those releases. It is not an import test.
+
 Current status: **import-tested on n8n 2.22.6** (bundling n8n-nodes-base 2.22.3), 2026-08-14.
 
 All three workflows were imported into a running n8n instance via `n8n import:workflow` and each was then opened on the canvas. Every node rendered — 11, 7, and 11 nodes respectively — with no "unrecognized node type" or unsupported-version errors.
